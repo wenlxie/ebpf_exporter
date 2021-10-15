@@ -1,9 +1,6 @@
 package main
 
 import (
-	"log"
-	"net/http"
-
 	"github.com/cloudflare/ebpf_exporter/config"
 	"github.com/cloudflare/ebpf_exporter/exporter"
 	"github.com/prometheus/client_golang/prometheus"
@@ -11,6 +8,9 @@ import (
 	"github.com/prometheus/common/version"
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
 	yaml "gopkg.in/yaml.v2"
+	"log"
+	"net/http"
+	"path/filepath"
 )
 
 func main() {
@@ -34,7 +34,8 @@ func main() {
 		log.Fatalf("Error creating exporter: %s", err)
 	}
 
-	err = e.Attach()
+	configPath := filepath.Dir((*configFile).Name())
+	err = e.Attach(configPath)
 	if err != nil {
 		log.Fatalf("Error attaching exporter: %s", err)
 	}

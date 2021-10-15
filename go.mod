@@ -4,6 +4,7 @@ go 1.16
 
 require (
 	github.com/alecthomas/units v0.0.0-20210912230133-d1bdfacee922 // indirect
+	github.com/aquasecurity/libbpfgo v0.2.1-libbpf-0.4.0
 	github.com/cespare/xxhash/v2 v2.1.2 // indirect
 	github.com/golang/protobuf v1.5.2 // indirect
 	github.com/iovisor/gobpf v0.2.0

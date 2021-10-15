@@ -6,13 +6,19 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"unsafe"
 
 	"github.com/cloudflare/ebpf_exporter/config"
 	"github.com/cloudflare/ebpf_exporter/decoder"
 	"github.com/iovisor/gobpf/bcc"
 	"github.com/prometheus/client_golang/prometheus"
+
+	bpf "github.com/aquasecurity/libbpfgo"
+	_ "github.com/aquasecurity/libbpfgo/helpers"
+
 )
 
 // Namespace to use for all metrics
@@ -21,12 +27,12 @@ const prometheusNamespace = "ebpf_exporter"
 // Exporter is a ebpf_exporter instance implementing prometheus.Collector
 type Exporter struct {
 	config              config.Config
-	modules             map[string]*bcc.Module
+	modules             map[string]*bpf.Module
 	perfMapCollectors   []*PerfMapSink
 	kaddrs              map[string]uint64
 	enabledProgramsDesc *prometheus.Desc
 	programInfoDesc     *prometheus.Desc
-	programTags         map[string]map[string]uint64
+	programFuncs         map[string][]string
 	descs               map[string]map[string]*prometheus.Desc
 	decoders            *decoder.Set
 }
@@ -48,64 +54,67 @@ func New(cfg config.Config) (*Exporter, error) {
 	programInfoDesc := prometheus.NewDesc(
 		prometheus.BuildFQName(prometheusNamespace, "", "ebpf_programs"),
 		"Info about ebpf programs",
-		[]string{"program", "function", "tag"},
+		[]string{"program", "function"},
 		nil,
 	)
 
 	return &Exporter{
 		config:              cfg,
-		modules:             map[string]*bcc.Module{},
+		modules:             map[string]*bpf.Module{},
 		kaddrs:              map[string]uint64{},
 		enabledProgramsDesc: enabledProgramsDesc,
 		programInfoDesc:     programInfoDesc,
-		programTags:         map[string]map[string]uint64{},
+		programFuncs:         map[string][]string{},
 		descs:               map[string]map[string]*prometheus.Desc{},
 		decoders:            decoder.NewSet(),
 	}, nil
 }
 
-// Attach injects eBPF into kernel and attaches necessary kprobes
-func (e *Exporter) Attach() error {
-	for _, program := range e.config.Programs {
-		if _, ok := e.modules[program.Name]; ok {
-			return fmt.Errorf("multiple programs with name %q", program.Name)
-		}
+// Support CORE Mode
+func (e *Exporter) Attach(configPath string) error{
+     for _, program := range e.config.Programs{
+		 BPFObjPath := program.Name
+		 fmt.Printf("%v", BPFObjPath)
 
-		code, err := e.code(program)
-		if err != nil {
-			return err
-		}
+		 btfProg := filepath.Join(configPath,BPFObjPath+".bpf.o" )
+		 _,err := os.Stat(btfProg)
+		 if err != nil {
+			 return err
+		 }
 
-		module := bcc.NewModule(code, program.Cflags)
-		if module == nil {
-			return fmt.Errorf("error compiling module for program %q", program.Name)
-		}
+		 bpfModule, err := bpf.NewModuleFromFile(btfProg)
+		 if err != nil {
+			 return fmt.Errorf("Error to create new module:%v", err)
+		 }
 
-		tags, err := attach(module, program.Kprobes, program.Kretprobes, program.Tracepoints, program.RawTracepoints)
+		 err = bpfModule.BPFLoadObject()
+         if err != nil {
+			 return fmt.Errorf("Error to load program:%s object  %v", BPFObjPath, err)
+		 }
 
-		if err != nil {
-			return fmt.Errorf("failed to attach to program %q: %s", program.Name, err)
-		}
+         f, err := attach(bpfModule,program.Kprobes,program.Kretprobes,program.Tracepoints,program.RawTracepoints)
+		 if err != nil {
+			 return fmt.Errorf("Error to attach program:%s, err:%v", program.Name, err)
+		 }
+		 e.programFuncs[program.Name] = f
+		 for _, perfEventConfig := range program.PerfEvents {
+			 prog, err := bpfModule.GetProgram(perfEventConfig.Target)
+			 if err != nil {
+				 return fmt.Errorf("failed to get target %q in program %q: %s", perfEventConfig.Target, program.Name, err)
+			 }
 
-		e.programTags[program.Name] = tags
+			 fd := prog.GetFd()
+			 _, err = prog.AttachPerfEvent(fd)
+			 if err != nil {
+				 return fmt.Errorf("failed to attach perf event %d:%d to %q in program %q: %s", perfEventConfig.Type, perfEventConfig.Name, perfEventConfig.Target, program.Name, err)
+			 }
+		 }
 
-		for _, perfEventConfig := range program.PerfEvents {
-			target, err := module.LoadPerfEvent(perfEventConfig.Target)
-			if err != nil {
-				return fmt.Errorf("failed to load target %q in program %q: %s", perfEventConfig.Target, program.Name, err)
-			}
-
-			err = module.AttachPerfEvent(perfEventConfig.Type, perfEventConfig.Name, perfEventConfig.SamplePeriod, perfEventConfig.SampleFrequency, -1, -1, -1, target)
-			if err != nil {
-				return fmt.Errorf("failed to attach perf event %d:%d to %q in program %q: %s", perfEventConfig.Type, perfEventConfig.Name, perfEventConfig.Target, program.Name, err)
-			}
-		}
-
-		e.modules[program.Name] = module
-	}
-
-	return nil
+		 e.modules[program.Name] = bpfModule
+	 }
+	 return nil
 }
+
 
 // code generates program code, augmented if necessary
 func (e Exporter) code(program config.Program) (string, error) {
@@ -132,7 +141,6 @@ func (e Exporter) code(program config.Program) (string, error) {
 }
 
 // populateKaddrs populates cache of ksym -> kaddr mappings
-// TODO: move to github.com/iovisor/gobpf/pkg/ksym
 func (e Exporter) populateKaddrs() error {
 	fd, err := os.Open("/proc/kallsyms")
 	if err != nil {
@@ -169,7 +177,6 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 			for _, label := range labels {
 				labelNames = append(labelNames, label.Name)
 			}
-
 			e.descs[programName][name] = prometheus.NewDesc(prometheus.BuildFQName(prometheusNamespace, "", name), help, labelNames, nil)
 		}
 
@@ -205,9 +212,9 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(e.enabledProgramsDesc, prometheus.GaugeValue, 1, program.Name)
 	}
 
-	for program, tags := range e.programTags {
-		for function, tag := range tags {
-			ch <- prometheus.MustNewConstMetric(e.programInfoDesc, prometheus.GaugeValue, 1, program, function, fmt.Sprintf("%x", tag))
+	for program, funcs := range e.programFuncs {
+		for _, function := range funcs {
+			ch <- prometheus.MustNewConstMetric(e.programInfoDesc, prometheus.GaugeValue, 1, program, function)
 		}
 	}
 
@@ -219,22 +226,60 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	e.collectHistograms(ch)
 }
 
+func (e *Exporter) tableValues(module *bpf.Module, tableName string, labels []config.Label) ([]metricValue, error) {
+	values := []metricValue{}
+
+	table, err := module.GetMap(tableName)
+	if err != nil {
+		return nil, fmt.Errorf("Can't get table:%s", tableName)
+	}
+
+    keySize := uint(0)
+	for _, label := range labels {
+		keySize += label.Size
+	}
+
+	iter := table.Iterator()
+	for iter.Next() {
+		key := iter.Key()
+		raw := *(*string)(unsafe.Pointer(&key))
+		mv := metricValue{
+			raw:    raw,
+			labels: make([]string, len(labels)),
+		}
+		mv.labels, err = e.decoders.DecodeLabels(key, labels)
+		if err != nil {
+			if err == decoder.ErrSkipLabelSet {
+				continue
+			}
+			return nil, err
+		}
+        //Assume counter's value type is always u64
+		v , err := table.GetValue(unsafe.Pointer(&key[0]))
+		if err != nil {
+			return nil, err
+		}
+
+		mv.value = float64(bcc.GetHostByteOrder().Uint64(v))
+		values = append(values, mv)
+	}
+
+	return values, nil
+}
+
 // collectCounters sends all known counters to prometheus
 func (e *Exporter) collectCounters(ch chan<- prometheus.Metric) {
 	for _, program := range e.config.Programs {
-		for _, counter := range program.Metrics.Counters {
+		for _, counter := range program.Metrics.Counters{
 			if len(counter.PerfMap) != 0 {
 				continue
 			}
-
 			tableValues, err := e.tableValues(e.modules[program.Name], counter.Table, counter.Labels)
 			if err != nil {
 				log.Printf("Error getting table %q values for metric %q of program %q: %s", counter.Table, counter.Name, program.Name, err)
 				continue
 			}
-
 			desc := e.descs[program.Name][counter.Name]
-
 			for _, metricValue := range tableValues {
 				ch <- prometheus.MustNewConstMetric(desc, prometheus.CounterValue, metricValue.value, metricValue.labels...)
 			}
@@ -244,18 +289,16 @@ func (e *Exporter) collectCounters(ch chan<- prometheus.Metric) {
 
 // collectHistograms sends all known historams to prometheus
 func (e *Exporter) collectHistograms(ch chan<- prometheus.Metric) {
+	fmt.Printf("Start to collectHistograms ")
 	for _, program := range e.config.Programs {
 		for _, histogram := range program.Metrics.Histograms {
 			skip := false
-
 			histograms := map[string]histogramWithLabels{}
-
 			tableValues, err := e.tableValues(e.modules[program.Name], histogram.Table, histogram.Labels)
 			if err != nil {
 				log.Printf("Error getting table %q values for metric %q of program %q: %s", histogram.Table, histogram.Name, program.Name, err)
 				continue
 			}
-
 			// Taking the last label and using int as bucket delimiter, for example:
 			//
 			// Before:
@@ -309,42 +352,6 @@ func (e *Exporter) collectHistograms(ch chan<- prometheus.Metric) {
 			}
 		}
 	}
-}
-
-// tableValues returns values in the requested table to be used in metircs
-func (e *Exporter) tableValues(module *bcc.Module, tableName string, labels []config.Label) ([]metricValue, error) {
-	values := []metricValue{}
-
-	table := bcc.NewTable(module.TableId(tableName), module)
-	iter := table.Iter()
-
-	for iter.Next() {
-		key := iter.Key()
-		raw, err := table.KeyBytesToStr(key)
-		if err != nil {
-			return nil, fmt.Errorf("error decoding key %v", key)
-		}
-
-		mv := metricValue{
-			raw:    raw,
-			labels: make([]string, len(labels)),
-		}
-
-		mv.labels, err = e.decoders.DecodeLabels(key, labels)
-		if err != nil {
-			if err == decoder.ErrSkipLabelSet {
-				continue
-			}
-
-			return nil, err
-		}
-
-		mv.value = float64(bcc.GetHostByteOrder().Uint64(iter.Leaf()))
-
-		values = append(values, mv)
-	}
-
-	return values, nil
 }
 
 func (e Exporter) exportTables() (map[string]map[string][]metricValue, error) {

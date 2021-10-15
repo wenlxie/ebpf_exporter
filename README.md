@@ -49,7 +49,7 @@ To build a binary from latest sources:
 $ go get -u -v github.com/cloudflare/ebpf_exporter/...
 ```
 
-To run with [`bio`](examples/bio.yaml) config (you need `root` privileges):
+To run with [`bio`](examples/bcc/bio.yaml) config (you need `root` privileges):
 
 ```
 $ ~/go/bin/ebpf_exporter --config.file=src/github.com/cloudflare/ebpf_exporter/examples/bio.yaml
@@ -299,7 +299,7 @@ To nicely plot these in Grafana, you'll need v5.1:
 
 * https://github.com/grafana/grafana/pull/11087
 
-![Histogram](examples/bio.write.latency.png)
+![Histogram](examples/bcc/bio.write.latency.png)
 
 ```yaml
 programs:
@@ -771,7 +771,7 @@ code: [ code ]
 
 #### `perf_event`
 
-See [llcstat](examples/llcstat.yaml) as an example.
+See [llcstat](examples/bcc/llcstat.yaml) as an example.
 
 ```
 - type: [ perf event type code ]
@@ -809,7 +809,7 @@ labels:
   [ - label ]
 ```
 
-An example of `perf_map` can be found [here](examples/oomkill.yaml).
+An example of `perf_map` can be found [here](examples/bcc/oomkill.yaml).
 
 #### `histogram`
 
